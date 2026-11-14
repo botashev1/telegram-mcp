@@ -6,17 +6,20 @@ import asyncio
 import getpass
 import json
 import os
-from pathlib import Path
 import sys
 import tempfile
+from pathlib import Path
 
 from telethon import TelegramClient, types
 from telethon.errors import (
-    FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError,
-    PhoneCodeInvalidError, SessionPasswordNeededError,
+    FloodWaitError,
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel, Chat, User
+from telethon.tl.types import Channel, Chat
 from telethon.utils import get_peer_id
 
 
@@ -36,7 +39,7 @@ class OwnerLoginClient(TelegramClient):
                 incoming = await self._updates_queue.get()
                 if isinstance(incoming, types.UpdateShort):
                     updates = [incoming.update]
-                elif isinstance(incoming, (types.Updates, types.UpdatesCombined)):
+                elif isinstance(incoming, types.Updates | types.UpdatesCombined):
                     updates = incoming.updates
                 else:
                     updates = [incoming]
@@ -119,7 +122,8 @@ async def sign_in_password(client) -> None:
 
 
 async def sign_in_code(client, phone, phone_code_hash) -> None:
-    print("Use the latest Telegram code for this current setup login, not a code for my.telegram.org website login.")
+    print("Use the latest Telegram code for this current setup login, "
+          "not a code for my.telegram.org website login.")
     print("No replacement code will be requested automatically.")
     for attempt in range(1, 4):
         code = "".join(getpass.getpass(f"Telegram login code (hidden, attempt {attempt}/3): ").split())
@@ -133,28 +137,39 @@ async def sign_in_code(client, phone, phone_code_hash) -> None:
         except PhoneCodeInvalidError:
             print("Code not accepted. Check the latest code for this setup login and try again.")
         except PhoneCodeExpiredError:
-            raise AuthenticationStopped("The login code expired. Setup stopped; start a new setup login when ready.") from None
+            raise AuthenticationStopped(
+                "The login code expired. Setup stopped; start a new setup login when ready."
+            ) from None
         except SessionPasswordNeededError:
             await sign_in_password(client)
             return
         finally:
             del code
-    raise AuthenticationStopped("Three code attempts failed. Setup stopped; no replacement code was requested.")
+    raise AuthenticationStopped(
+        "Three code attempts failed. Setup stopped; no replacement code was requested."
+    )
 
 
 def code_delivery_message(sent) -> str:
     from telethon.tl.types.auth import (
-        SentCodeTypeApp, SentCodeTypeSms, SentCodeTypeCall, SentCodeTypeEmailCode,
+        SentCodeTypeApp,
+        SentCodeTypeCall,
+        SentCodeTypeEmailCode,
+        SentCodeTypeSms,
     )
     messages = {
-        SentCodeTypeApp: "Telegram selected code delivery to an already signed-in Telegram app. Check the verified Telegram service chat.",
+        SentCodeTypeApp: ("Telegram selected code delivery to an already signed-in Telegram app. "
+                          "Check the verified Telegram service chat."),
         SentCodeTypeSms: "Telegram selected SMS delivery. Check SMS on the account's phone.",
         SentCodeTypeCall: "Telegram selected a phone call. Use the numeric code from that call.",
         SentCodeTypeEmailCode: "Telegram selected email delivery. Check the email configured for login.",
     }
     message = messages.get(type(getattr(sent, "type", None)))
     if message is None:
-        raise AuthenticationStopped("Telegram selected a login method this code flow does not support. Stop and use local QR login instead.")
+        raise AuthenticationStopped(
+            "Telegram selected a login method this code flow does not support. "
+            "Stop and use local QR login instead."
+        )
     return message
 
 
@@ -175,8 +190,10 @@ async def wait_with_local_qr(qr) -> None:
     waiter = asyncio.create_task(qr.wait())
     try:
         await asyncio.sleep(0)
-        print("In your signed-in Telegram phone app: Settings > Devices > Link Desktop Device, then scan this QR.")
-        print("This QR is a login credential. Do not share or record this terminal. It is not saved to a file.")
+        print("In your signed-in Telegram phone app: "
+              "Settings > Devices > Link Desktop Device, then scan this QR.")
+        print("This QR is a login credential. Do not share or record this terminal. "
+              "It is not saved to a file.")
         renderer = qrcode.QRCode(border=4)
         renderer.add_data(qr.url)
         renderer.make(fit=True)
@@ -204,8 +221,12 @@ async def sign_in_qr(client) -> None:
                 return
             except asyncio.TimeoutError:
                 if attempt == 3:
-                    raise AuthenticationStopped("Three QR codes expired. Setup stopped; no credentials were saved.") from None
-                choice = input("QR expired. Press Enter to create a new QR, or type q to cancel: ").strip().lower()
+                    raise AuthenticationStopped(
+                        "Three QR codes expired. Setup stopped; no credentials were saved."
+                    ) from None
+                choice = input(
+                    "QR expired. Press Enter to create a new QR, or type q to cancel: "
+                ).strip().lower()
                 if choice:
                     raise AuthenticationStopped("QR login cancelled; no credentials were saved.") from None
     finally:
@@ -280,7 +301,8 @@ async def setup(args) -> None:
                 if client.is_connected() and await client.is_user_authorized():
                     await client.log_out()
             except Exception:
-                print("Setup stopped. Check Telegram Devices and revoke the unfinished setup session if present.")
+                print("Setup stopped. Check Telegram Devices and revoke "
+                      "the unfinished setup session if present.")
         await client.disconnect()
 
 
@@ -296,10 +318,12 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
     except FloodWaitError as exc:
-        print(f"Telegram requires waiting {max(0, int(exc.seconds))} seconds. Setup stopped without retrying.", file=sys.stderr)
+        print(f"Telegram requires waiting {max(0, int(exc.seconds))} seconds. "
+              "Setup stopped without retrying.", file=sys.stderr)
         return 1
     except (Exception, KeyboardInterrupt) as exc:
-        print(f"Setup stopped ({type(exc).__name__}). No secret values or other chats are shown.", file=sys.stderr)
+        print(f"Setup stopped ({type(exc).__name__}). "
+              "No secret values or other chats are shown.", file=sys.stderr)
         return 1
     return 0
 
