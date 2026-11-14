@@ -1,8 +1,9 @@
 """Text-only reads over a closed chat policy."""
 from __future__ import annotations
 
-from .core import AllowList, ChatNotAllowed, sanitize_text
 from .client import marked_id as _marked_id
+from .core import AllowList, ChatNotAllowed, sanitize_text
+from .media import attachment_metadata
 from .rich import rich_message_text
 
 MAX_LIMIT = 200
@@ -28,7 +29,7 @@ def _message_to_dict(message) -> dict:
     date = getattr(message, "date", None)
     text = (getattr(message, "text", None) or getattr(message, "message", None)
             or rich_message_text(getattr(message, "rich_message", None)))
-    return {
+    result = {
         "id": getattr(message, "id", None),
         "date": date.isoformat() if date is not None else None,
         "sender": _display_name(getattr(message, "sender", None)),
@@ -36,6 +37,10 @@ def _message_to_dict(message) -> dict:
         "text": sanitize_text(text),
         "reply_to": getattr(message, "reply_to_msg_id", None),
     }
+    attachment = attachment_metadata(message)
+    if attachment is not None:
+        result["attachment"] = attachment
+    return result
 
 
 async def _messages_to_dicts(client, entity, messages) -> list[dict]:
@@ -124,7 +129,7 @@ async def list_chats(client, allowlist: AllowList) -> dict:
         item = {"alias": entry.alias, "id": entry.id, "title": entry.title}
         try:
             _, entity = await _entity_of(client, allowlist, entry.id)
-        except Exception as exc:
+        except Exception:
             item["error"] = "The configured chat could not be read."
         else:
             item["title"] = _display_name(entity, entry.title)
@@ -216,7 +221,7 @@ async def search_messages(client, allowlist: AllowList, query, chat=None, limit=
             messages = await client.get_messages(entity, limit=limit, search=str(query))
         except ChatNotAllowed:
             raise
-        except Exception as exc:
+        except Exception:
             errors.append({"alias": entry.alias, "error": "The configured chat could not be searched."})
             continue
         for item in await _messages_to_dicts(client, entity, messages):

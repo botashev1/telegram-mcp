@@ -1,11 +1,9 @@
-import ipaddress
 import socket
 import struct
 import threading
 from unittest.mock import patch
 
 import pytest
-
 from telegram_egress import TelegramProxy, read_exact, sandbox_profile, target_allowed
 
 
@@ -88,3 +86,65 @@ def test_relays_only_after_valid_destination():
 def test_profile_cannot_inject_port():
     with pytest.raises(ValueError):
         sandbox_profile('80"))(allow network*)')
+
+
+def test_profile_remains_read_only_without_download_directory():
+    profile = sandbox_profile(12345)
+    assert '(deny file-write*)' in profile
+    assert '(allow file-write*' not in profile
+
+
+def test_profile_grants_only_protected_cache(tmp_path):
+    cache = tmp_path / 'downloads'
+    cache.mkdir(mode=0o700)
+    profile = sandbox_profile(12345, str(cache))
+    assert profile.count('(allow file-write*') == 1
+    assert f'(allow file-write* (subpath "{cache}"))' in profile
+    assert '(deny network*)' in profile
+    assert '(deny file-read* (subpath "/Users"))' in profile
+
+
+@pytest.mark.parametrize('path', ['relative', '/', '/tmp', '/a"))(allow network*)', '/a\\b', '/a\nb'])
+def test_profile_rejects_noncanonical_or_unsafe_download_paths(path):
+    with pytest.raises((ValueError, OSError)):
+        sandbox_profile(12345, path)
+
+
+def test_profile_rejects_symlink_download_directory(tmp_path):
+    target = tmp_path / 'target'
+    target.mkdir(mode=0o700)
+    link = tmp_path / 'link'
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match='symlinks'):
+        sandbox_profile(12345, str(link))
+
+
+def test_profile_rejects_group_writable_cache(tmp_path):
+    cache = tmp_path / 'downloads'
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o770)
+    with pytest.raises(ValueError, match='writable by others'):
+        sandbox_profile(12345, str(cache))
+
+
+def test_child_ignores_download_environment_without_explicit_argument(tmp_path):
+    from telegram_egress import run_sandboxed_child
+    with patch('telegram_egress.TelegramProxy') as proxy, patch('telegram_egress.subprocess.Popen') as popen:
+        proxy.return_value.__enter__.return_value.port = 12345
+        popen.return_value.wait.return_value = 0
+        assert run_sandboxed_child(['synthetic'], {'TG_DOWNLOAD_DIR': '/arbitrary'}, str(tmp_path)) == 0
+        assert 'TG_DOWNLOAD_DIR' not in popen.call_args.kwargs['env']
+        assert '(allow file-write*' not in popen.call_args.args[0][2]
+
+
+def test_child_sets_download_environment_from_verified_argument(tmp_path):
+    from telegram_egress import run_sandboxed_child
+    cache = tmp_path / 'downloads'
+    cache.mkdir(mode=0o700)
+    with patch('telegram_egress.TelegramProxy') as proxy, patch('telegram_egress.subprocess.Popen') as popen:
+        proxy.return_value.__enter__.return_value.port = 12345
+        popen.return_value.wait.return_value = 0
+        assert run_sandboxed_child(
+            ['synthetic'], {'TG_DOWNLOAD_DIR': '/arbitrary'}, str(tmp_path), str(cache),
+        ) == 0
+        assert popen.call_args.kwargs['env']['TG_DOWNLOAD_DIR'] == str(cache)

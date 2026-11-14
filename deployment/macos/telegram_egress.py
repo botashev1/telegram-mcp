@@ -5,10 +5,12 @@ import ipaddress
 import os
 import select
 import socket
+import stat
 import struct
 import subprocess
 import threading
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 # https://core.telegram.org/resources/cidr.txt, verified 2026-11-14.
 TELEGRAM_NETWORKS = tuple(map(ipaddress.ip_network, (
@@ -161,27 +163,51 @@ class TelegramProxy:
                     destination.sendall(payload)
 
 
-def sandbox_profile(port: int) -> str:
+def _download_directory(path: str) -> str:
+    """Only a pre-created, canonical, service-owned directory may be writable."""
+    if not isinstance(path, str) or any(char in path for char in '\"\\\n\r\x00'):
+        raise ValueError('Invalid download directory')
+    directory = Path(path)
+    if directory == Path('/') or not directory.is_absolute() or str(directory) != path:
+        raise ValueError('Download directory must be an absolute canonical path')
+    if str(directory.resolve(strict=True)) != path:
+        raise ValueError('Download directory cannot contain symlinks')
+    info = directory.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValueError('Download directory must be service-owned and not writable by others')
+    return path
+
+
+def sandbox_profile(port: int, download_dir: str | None = None) -> str:
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError('Invalid proxy port')
+    writable = []
+    if download_dir is not None:
+        writable.append(f'(allow file-write* (subpath "{_download_directory(download_dir)}"))')
     return '\n'.join((
         '(version 1)',
         '(allow default)',
         '(deny network*)',
         f'(allow network-outbound (remote tcp "localhost:{port}"))',
         '(deny file-write*)',
+        *writable,
         '(deny file-read* (subpath \"/Users\"))',
         '(deny mach-lookup)',
     ))
 
 
-def run_sandboxed_child(command: Sequence[str], environment: Mapping[str, str], cwd: str) -> int:
+def run_sandboxed_child(
+    command: Sequence[str], environment: Mapping[str, str], cwd: str, download_dir: str | None = None,
+) -> int:
     """Called only by the fixed, root-owned launcher; never accept MCP parameters."""
     with TelegramProxy() as proxy:
         env = dict(environment)
         env['TG_LOCAL_PROXY_PORT'] = str(proxy.port)
         env['PYTHONDONTWRITEBYTECODE'] = '1'
-        profile = sandbox_profile(proxy.port)
+        env.pop('TG_DOWNLOAD_DIR', None)
+        if download_dir is not None:
+            env['TG_DOWNLOAD_DIR'] = _download_directory(download_dir)
+        profile = sandbox_profile(proxy.port, download_dir)
         child = subprocess.Popen(
             ['/usr/bin/sandbox-exec', '-p', profile, *command],
             env=env, cwd=cwd, close_fds=True,
