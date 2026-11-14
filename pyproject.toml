@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "telegram-allowlist-mcp"
+name = "telegram-read-only-local"
 dynamic = ["version"]
 description = "Read-only MCP server for Telegram with a per-chat allowlist"
 readme = "README.md"
@@ -23,23 +23,13 @@ classifiers = [
     "Topic :: Communications :: Chat",
 ]
 dependencies = [
-    "mcp>=2.0,<3",
-    "telethon>=1.36,<2",
-]
-
-[project.optional-dependencies]
-# Draws the QR code for `telegram-mcp login --qr`; the server does not need it.
-qr = [
-    "qrcode>=7.4",
-]
-dev = [
-    "pytest>=8",
-    "ruff>=0.6",
-    "qrcode>=7.4",
+    "mcp==2.3.0",
+    "telethon==1.45.0",
+    "python-socks[asyncio]==2.8.2",
 ]
 
 [project.scripts]
-telegram-mcp = "telegram_mcp.cli:main"
+telegram-read-only = "telegram_mcp.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/nskondratev/telegram-mcp"

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+[ "$#" -eq 0 ] || exit 64
+cd /Library/TelegramReadOnly
+exec /usr/bin/env -i HOME=/Library/TelegramReadOnly/private USER=_telegram_read LOGNAME=_telegram_read PATH=/usr/bin:/bin LANG=en_US.UTF-8 OTEL_SDK_DISABLED=true /Library/TelegramReadOnly/python/bin/python3.12 -I -B /Library/TelegramReadOnly/launcher.py

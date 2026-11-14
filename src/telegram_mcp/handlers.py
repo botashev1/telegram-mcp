@@ -1,35 +1,15 @@
-"""Reading Telegram on top of the allowlist: these operations, reads only.
-
-Every function asks the allowlist first and only then touches the client, so a
-chat outside the list never reaches the network at all. The client is passed in
-(Telethon in production, a fake in tests), which keeps the logic testable
-without an account.
-"""
+"""Text-only reads over a closed chat policy."""
 from __future__ import annotations
 
-from .core import AllowList, ChatNotAllowed, sanitize_emoji, sanitize_text
+from .core import AllowList, ChatNotAllowed, sanitize_text
+from .client import marked_id as _marked_id
 from .rich import rich_message_text
 
 MAX_LIMIT = 200
 DEFAULT_LIMIT = 50
-#: Telegram hands out at most this many reactions per page.
-REACTIONS_MAX_LIMIT = 100
-#: Page size cap for the voters of a poll.
-POLL_VOTES_MAX_LIMIT = 50
-
-
-def _marked_id(entity) -> int | None:
-    """Peer id in the same form the allowlist stores it (-100… for channels)."""
-    try:
-        from telethon.utils import get_peer_id  # noqa: PLC0415 — optional in tests
-
-        return get_peer_id(entity)
-    except Exception:
-        return getattr(entity, "id", None)
 
 
 def _display_name(entity, fallback: str = "") -> str:
-    """Chat name or person name: groups have a title, users have first/last name."""
     if entity is None:
         return fallback
     title = getattr(entity, "title", None)
@@ -37,271 +17,29 @@ def _display_name(entity, fallback: str = "") -> str:
         return sanitize_text(title, limit=120)
     parts = [getattr(entity, "first_name", None), getattr(entity, "last_name", None)]
     name = " ".join(p for p in parts if p).strip()
-    if not name:
-        name = getattr(entity, "username", None) or ""
-    return sanitize_text(name, limit=120) or fallback
+    return sanitize_text(name or getattr(entity, "username", None) or fallback, limit=120)
 
 
 def _chat_ref(entry, entity) -> dict:
     return {"alias": entry.alias, "id": entry.id, "title": _display_name(entity, entry.title)}
 
 
-def _media_type(message) -> str | None:
-    media = getattr(message, "media", None)
-    if media is None:
-        return None
-    name = type(media).__name__
-    return name[len("MessageMedia") :] if name.startswith("MessageMedia") else name
-
-
-def file_info(message) -> dict | None:
-    """What is worth knowing about an attachment before deciding to fetch it.
-
-    None when the message carries no file at all: an empty object here would
-    read as "a file nothing is known about", which is a different thing.
-
-    ``name`` and ``mime`` are uploader-controlled free-form strings, exactly
-    like a message text, so they are sanitised the same way before reaching
-    the model.
-    """
-    file = getattr(message, "file", None)
-    if file is None:
-        return None
-    name = getattr(file, "name", None)
-    mime = getattr(file, "mime_type", None)
-    return {
-        "size": getattr(file, "size", None),
-        # Absent stays absent. A photo carries no file name at all, and sanitising
-        # None into "" would claim it carries an empty one — the same distinction
-        # this function makes between no file and a file nothing is known about.
-        "name": sanitize_text(name, limit=200) if name else None,
-        "ext": getattr(file, "ext", None) or "",
-        "mime": sanitize_text(mime, limit=200) if mime else None,
-        "duration": getattr(file, "duration", None),
-    }
-
-
-def _reaction_identity(reaction) -> tuple | None:
-    """What tells one reaction from another, or None for an empty one."""
-    emoticon = getattr(reaction, "emoticon", None)
-    if emoticon:
-        return ("emoji", emoticon)
-    document_id = getattr(reaction, "document_id", None)
-    if document_id is not None:
-        return ("custom", document_id)
-    if type(reaction).__name__ == "ReactionPaid":
-        return ("paid",)
-    return None
-
-
-def _reaction_label(reaction, custom_emoji) -> dict | None:
-    """A reaction as the model reads it.
-
-    A custom emoji carries the emoji it stands for, when known, and its id as a
-    string: document ids run past 2**53, and a JavaScript client would round
-    them as numbers.
-    """
-    identity = _reaction_identity(reaction)
-    if identity is None:
-        return None
-    if identity[0] == "emoji":
-        return {"emoji": sanitize_emoji(identity[1])}
-    if identity[0] == "custom":
-        alt = custom_emoji.get(identity[1])
-        return {"emoji": sanitize_emoji(alt) or None, "custom_emoji_id": str(identity[1])}
-    return {"emoji": "⭐", "paid": True}
-
-
-def _person(peer, date, names) -> dict:
-    """Someone who reacted or voted: the id, the name when known, and when they did it."""
-    peer_id = _marked_id(peer)
-    return {
-        "id": peer_id,
-        "name": names.get(peer_id),
-        "date": date.isoformat() if date is not None else None,
-    }
-
-
-def _reactor(entry, names) -> dict:
-    return _person(getattr(entry, "peer_id", None), getattr(entry, "date", None), names)
-
-
-def reactions_info(message, names=None, custom_emoji=None, reactors=True) -> list[dict] | None:
-    """The reactions on a message: each emoji, its count, and whether one of them is mine.
-
-    None when there are none, for the same reason as file_info. ``by`` lists who
-    reacted, as far as Telegram says in the message itself — usually only the
-    latest few, and nobody at all in a channel. Names are looked up by the
-    caller, see _reactor_names.
-    """
-    reactions = getattr(message, "reactions", None)
-    results = getattr(reactions, "results", None) or []
-    recent = (getattr(reactions, "recent_reactions", None) or []) if reactors else []
-    names = names or {}
-    custom_emoji = custom_emoji or {}
-    items = []
-    for result in results:
-        label = _reaction_label(result.reaction, custom_emoji)
-        if label is None:
-            continue
-        # For a paid reaction Telegram counts Telegram Stars, not people.
-        item = {**label, ("stars" if label.get("paid") else "count"): result.count}
-        if result.chosen_order is not None:
-            item["mine"] = True
-        identity = _reaction_identity(result.reaction)
-        by = [_reactor(r, names) for r in recent if _reaction_identity(r.reaction) == identity]
-        if by:
-            item["by"] = by
-        items.append(item)
-    return items or None
-
-
-def _plain_text(value) -> str:
-    """The text of a TextWithEntities, which is what a poll question and its options are."""
-    if value is None or isinstance(value, str):
-        return value or ""
-    return getattr(value, "text", None) or ""
-
-
-def _poll_of(message):
-    """The MessageMediaPoll of a message, or None for anything that is not a poll."""
-    media = getattr(message, "media", None)
-    if type(media).__name__ != "MessageMediaPoll" or getattr(media, "poll", None) is None:
-        return None
-    return media
-
-
-def _hidden_results_note(poll) -> str:
-    if getattr(poll, "hide_results_until_close", None) and not getattr(poll, "closed", None):
-        return (
-            "This poll hides its results until it closes: Telegram sent the question and the "
-            "options, not the votes."
-        )
-    return (
-        "Telegram did not send the results of this poll — it shows them to those who voted — "
-        "so only the question and the options are known, not the votes."
-    )
-
-
-def poll_info(message) -> dict | None:
-    """The poll of a message: the question, the options and, when Telegram tells them, the votes.
-
-    None when the message is not a poll, for the same reason as file_info.
-    ``option`` is the option's position in the poll, which get_poll_votes takes
-    to narrow the voters down. Votes come only from the results Telegram put in
-    the message: when it put none there, the options carry no ``voters`` and
-    ``note`` says why — reporting zeroes would read as a poll nobody voted in.
-    """
-    media = _poll_of(message)
-    if media is None:
-        return None
-    poll = media.poll
-    results = getattr(media, "results", None)
-    counted = {r.option: r for r in getattr(results, "results", None) or [] if r.voters is not None}
-    total = getattr(results, "total_voters", None)
-    info = {
-        "question": sanitize_text(_plain_text(poll.question), limit=300),
-        "anonymous": not poll.public_voters,
-        "multiple_choice": bool(poll.multiple_choice),
-        "quiz": bool(poll.quiz),
-        "closed": bool(poll.closed),
-        "total_voters": total,
-        "options": [],
-    }
-    close_date = getattr(poll, "close_date", None)
-    if close_date is not None and not poll.closed:
-        info["closes_at"] = close_date.isoformat()
-    for index, answer in enumerate(poll.answers):
-        item = {"option": index, "text": sanitize_text(_plain_text(answer.text), limit=200)}
-        votes = counted.get(answer.option)
-        if votes is not None:
-            item["voters"] = votes.voters
-            # Of the people who voted: in a multiple choice poll the shares add up past 100.
-            item["percent"] = round(100 * votes.voters / total, 1) if total else 0.0
-            if votes.chosen:
-                item["chosen"] = True
-            if poll.quiz and votes.correct:
-                item["correct"] = True
-        info["options"].append(item)
-    if not counted:
-        info["note"] = _hidden_results_note(poll)
-    elif getattr(results, "min", None):
-        info["note"] = "Telegram sent these results without your own vote: chosen is not known."
-    solution = getattr(results, "solution", None)
-    if solution:
-        info["solution"] = sanitize_text(solution, limit=500)
-    return info
-
-
-def _names_of(entities) -> dict:
-    return {_marked_id(entity): _display_name(entity) or None for entity in entities}
-
-
-async def _reactor_names(client, entity, messages) -> dict:
-    """Names of everyone listed under the reactions of these messages, in one request.
-
-    Best-effort: a failed lookup leaves ids without names, it never fails the read.
-    """
-    message_ids = [
-        m.id for m in messages if getattr(getattr(m, "reactions", None), "recent_reactions", None)
-    ]
-    if not message_ids:
-        return {}
-    try:
-        return _names_of(await client.get_reaction_peers(entity, message_ids))
-    except Exception:
-        return {}
-
-
-async def _custom_emoji_of(client, messages) -> dict:
-    """The emoji behind every custom emoji reaction of these messages, in one request.
-
-    Best-effort, like _reactor_names: without it a custom emoji keeps only its id.
-    """
-    document_ids = []
-    for message in messages:
-        reactions = getattr(message, "reactions", None)
-        for result in getattr(reactions, "results", None) or []:
-            identity = _reaction_identity(result.reaction)
-            if identity is not None and identity[0] == "custom":
-                document_ids.append(identity[1])
-    if not document_ids:
-        return {}
-    try:
-        return await client.get_custom_emoji(document_ids)
-    except Exception:
-        return {}
-
-
-def _text_of(message) -> str | None:
-    """The message text; a rich message keeps it in blocks and leaves message.message empty."""
-    return (
-        getattr(message, "text", None)
-        or getattr(message, "message", None)
-        or rich_message_text(getattr(message, "rich_message", None))
-    )
-
-
-def _message_to_dict(message, names=None, custom_emoji=None) -> dict:
+def _message_to_dict(message) -> dict:
     date = getattr(message, "date", None)
+    text = (getattr(message, "text", None) or getattr(message, "message", None)
+            or rich_message_text(getattr(message, "rich_message", None)))
     return {
         "id": getattr(message, "id", None),
         "date": date.isoformat() if date is not None else None,
         "sender": _display_name(getattr(message, "sender", None)),
         "sender_id": getattr(message, "sender_id", None),
-        "text": sanitize_text(_text_of(message)),
+        "text": sanitize_text(text),
         "reply_to": getattr(message, "reply_to_msg_id", None),
-        "media": _media_type(message),
-        "file": file_info(message),
-        "reactions": reactions_info(message, names, custom_emoji),
-        "poll": poll_info(message),
     }
 
 
 async def _messages_to_dicts(client, entity, messages) -> list[dict]:
-    names = await _reactor_names(client, entity, messages)
-    custom_emoji = await _custom_emoji_of(client, messages)
-    return [_message_to_dict(m, names, custom_emoji) for m in messages]
+    return [_message_to_dict(message) for message in messages]
 
 
 def _clamp(limit, default: int = DEFAULT_LIMIT, maximum: int = MAX_LIMIT) -> int:
@@ -317,7 +55,7 @@ async def _entity_of(client, allowlist: AllowList, chat):
     entry = allowlist.entry(chat)
     entity = await client.get_entity(entry.id)
     actual = _marked_id(entity)
-    if not allowlist.contains(actual):
+    if actual != entry.id:
         raise ChatNotAllowed(
             f"Telegram returned chat id {actual} for {entry.alias!r}, which is not in the allowlist — "
             "request rejected."
@@ -383,11 +121,11 @@ async def list_chats(client, allowlist: AllowList) -> dict:
     chats = []
     resolved = []
     for entry in allowlist.entries:
-        item = {"alias": entry.alias, "id": entry.id, "title": entry.title, "note": entry.note}
+        item = {"alias": entry.alias, "id": entry.id, "title": entry.title}
         try:
             _, entity = await _entity_of(client, allowlist, entry.id)
         except Exception as exc:
-            item["error"] = f"{type(exc).__name__}: {exc}"
+            item["error"] = "The configured chat could not be read."
         else:
             item["title"] = _display_name(entity, entry.title)
             item["username"] = getattr(entity, "username", None)
@@ -410,7 +148,6 @@ async def get_chat_info(client, allowlist: AllowList, chat) -> dict:
         "username": getattr(entity, "username", None),
         "participants_count": getattr(entity, "participants_count", None),
         **_read_state(dialogs.get(_marked_id(entity))),
-        "note": entry.note,
     }
 
 
@@ -455,7 +192,7 @@ async def get_messages(
 async def get_message_context(client, allowlist: AllowList, chat, message_id, around=5) -> dict:
     """Messages around a specific one — enough to reconstruct a thread."""
     entry, entity = await _entity_of(client, allowlist, chat)
-    around = _clamp(around, default=5)
+    around = _clamp(around, default=5, maximum=99)
     messages = await client.get_messages(
         entity, limit=around * 2 + 1, offset_id=int(message_id), add_offset=-around
     )
@@ -480,7 +217,7 @@ async def search_messages(client, allowlist: AllowList, query, chat=None, limit=
         except ChatNotAllowed:
             raise
         except Exception as exc:
-            errors.append({"alias": entry.alias, "error": f"{type(exc).__name__}: {exc}"})
+            errors.append({"alias": entry.alias, "error": "The configured chat could not be searched."})
             continue
         for item in await _messages_to_dicts(client, entity, messages):
             item["chat_alias"] = entry.alias
@@ -493,142 +230,3 @@ async def search_messages(client, allowlist: AllowList, query, chat=None, limit=
         result["errors"] = errors
     return result
 
-
-async def get_message_reactions(
-    client, allowlist: AllowList, chat, message_id, reaction=None, limit=DEFAULT_LIMIT, offset=None
-) -> dict:
-    """Who reacted to one message and with what, a page at a time.
-
-    ``counts`` sums every reaction up; ``reactions`` lists the people behind them,
-    narrowed to one emoji by ``reaction``. ``total`` is how many people match the
-    request, the filter included and paid stars left out, so the list is complete
-    once it holds that many. Telegram hides
-    the list in channels and in chats that choose to: then only counts come back.
-    """
-    message_id = int(message_id)
-    if message_id <= 0:
-        # Telethon reads ids=0 as "no ids at all" and answers with a list of messages.
-        raise ValueError(f"message_id must be a positive message id, got {message_id}.")
-    wanted = (str(reaction).strip() or None) if reaction is not None else None
-    entry, entity = await _entity_of(client, allowlist, chat)
-    message = await client.get_messages(entity, ids=message_id)
-    if message is None:
-        raise ValueError(f"Message {message_id} was not found in {entry.alias!r}.")
-
-    custom_emoji = await _custom_emoji_of(client, [message])
-    counts = reactions_info(message, custom_emoji=custom_emoji, reactors=False) or []
-    result = {
-        "chat": _chat_ref(entry, entity),
-        "message_id": message_id,
-        "counts": counts,
-        "total": sum(
-            item.get("count", 0)
-            for item in counts
-            if wanted is None or wanted in (item["emoji"], item.get("custom_emoji_id"))
-        ),
-        "reactions": [],
-    }
-    if not counts:
-        return result
-    if not getattr(message.reactions, "can_see_list", False):
-        result["note"] = (
-            "Telegram does not disclose who reacted to this message (a channel, or a chat "
-            "that hides the list) — only the counts are known."
-        )
-        return result
-
-    page = await client.get_reactions_list(
-        entity,
-        message_id,
-        reaction=wanted,
-        limit=_clamp(limit, maximum=REACTIONS_MAX_LIMIT),
-        offset=offset or None,
-    )
-    names = _names_of([*page.users, *page.chats])
-    result["total"] = page.count
-    result["reactions"] = [
-        {**_reactor(r, names), **(_reaction_label(r.reaction, custom_emoji) or {})} for r in page.reactions
-    ]
-    if page.next_offset:
-        result["next_offset"] = page.next_offset
-    return result
-
-
-async def get_poll_votes(
-    client, allowlist: AllowList, chat, message_id, option=None, limit=DEFAULT_LIMIT, offset=None
-) -> dict:
-    """Who voted for what in one poll, a page at a time. Nothing is voted.
-
-    ``poll`` is the poll itself, the same as on the message; ``votes`` lists the
-    people behind it, narrowed to one option by ``option`` — its position in
-    ``poll.options``. ``total`` is how many people match the request, so the list
-    is complete once it holds that many. Telegram keeps the voters of an
-    anonymous poll secret, and shows those of an open one only when it shows the
-    results: then ``votes`` stays empty and ``note`` says why.
-    """
-    message_id = int(message_id)
-    if message_id <= 0:
-        # Telethon reads ids=0 as "no ids at all" and answers with a list of messages.
-        raise ValueError(f"message_id must be a positive message id, got {message_id}.")
-    if option is not None:
-        option = int(option)
-        if option < 0:
-            raise ValueError(f"option must be a position in poll.options (0 or more), got {option}.")
-    entry, entity = await _entity_of(client, allowlist, chat)
-    message = await client.get_messages(entity, ids=message_id)
-    if message is None:
-        raise ValueError(f"Message {message_id} was not found in {entry.alias!r}.")
-    poll = poll_info(message)
-    if poll is None:
-        raise ValueError(
-            f"Message {message_id} in {entry.alias!r} is not a poll "
-            f"(media: {_media_type(message) or 'none'})."
-        )
-    options = poll["options"]
-    if option is not None and option >= len(options):
-        raise ValueError(f"option must be a position in poll.options, 0 to {len(options) - 1}; got {option}.")
-
-    result = {
-        "chat": _chat_ref(entry, entity),
-        "message_id": message_id,
-        "poll": poll,
-        "total": poll["total_voters"] if option is None else options[option].get("voters"),
-        "votes": [],
-    }
-    if poll["anonymous"]:
-        result["note"] = "The poll is anonymous: Telegram does not disclose who voted — only the counts."
-        return result
-    if not any("voters" in item for item in options):
-        result["note"] = poll["note"]
-        return result
-
-    answers = _poll_of(message).poll.answers
-    positions = {answer.option: index for index, answer in enumerate(answers)}
-    page = await client.get_poll_votes(
-        entity,
-        message_id,
-        option=None if option is None else answers[option].option,
-        limit=_clamp(limit, maximum=POLL_VOTES_MAX_LIMIT),
-        offset=offset or None,
-    )
-    names = _names_of([*page.users, *page.chats])
-    result["total"] = page.count
-    for vote in page.votes:
-        if getattr(vote, "options", None) is not None:
-            chosen = [positions.get(raw) for raw in vote.options]
-        elif getattr(vote, "option", None) is not None:
-            chosen = [positions.get(vote.option)]
-        else:
-            # Asked for one option, Telegram leaves it out of every vote: it is the one asked for.
-            chosen = [option]
-        result["votes"].append(
-            {
-                **_person(getattr(vote, "peer", None), getattr(vote, "date", None), names),
-                "options": [
-                    {"option": i, "text": options[i]["text"] if i is not None else None} for i in chosen
-                ],
-            }
-        )
-    if page.next_offset:
-        result["next_offset"] = page.next_offset
-    return result
