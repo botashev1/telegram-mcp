@@ -1,7 +1,9 @@
 """Only explicitly configured Telegram peers can reach the underlying client."""
 from __future__ import annotations
 
+from .attachments import AttachmentError
 from .core import AllowList, ChatNotAllowed
+from .media import attachment_metadata, photo_size
 
 
 def marked_id(entity):
@@ -55,3 +57,41 @@ class ScopedClient:
         if any(marked_id(dialog.peer) not in expected_ids for dialog in dialogs):
             raise ChatNotAllowed("Telegram returned an unexpected chat dialog.")
         return dialogs
+
+    async def download_attachment(self, chat_id: int, message_id: int, output, max_bytes: int) -> dict:
+        """Download one freshly checked message into a caller-owned bounded stream."""
+        entry = self._allowlist.entry(chat_id)
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            raise AttachmentError("message_id must be a positive integer.")
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+            raise AttachmentError("The attachment size limit must be a positive integer.")
+        if not callable(getattr(output, "write", None)):
+            raise AttachmentError("Attachments require a bounded output stream, not a file path.")
+        # Telethon's ids= path uses account-wide GetMessages for basic groups
+        # and users, filtering the peer only after receiving its response.
+        # A narrow history window keeps the Telegram request peer-scoped.
+        messages = await self._inner.get_messages(
+            input_peer(entry), limit=1, min_id=message_id - 1, max_id=message_id + 1,
+        )
+        if not messages or len(messages) != 1 or messages[0] is None:
+            raise AttachmentError("The requested attachment message is unavailable.")
+        message = messages[0]
+        if getattr(message, "chat_id", None) != entry.id or getattr(message, "id", None) != message_id:
+            raise ChatNotAllowed("Telegram returned an unexpected attachment message identity.")
+        metadata = attachment_metadata(message)
+        if metadata is None or not metadata["downloadable"]:
+            raise AttachmentError("The message has no supported downloadable attachment.")
+        if metadata["size"] > max_bytes:
+            raise AttachmentError("The attachment exceeds the configured size limit.")
+        kwargs = {"file": output}
+        if metadata["kind"] == "photo":
+            _, selected = photo_size(message.media.photo)
+            kwargs["thumb"] = selected.type
+        # Passing Message would enable Telethon's automatic file-reference
+        # refresh via get_messages(ids=...). Use only the checked media so an
+        # expired reference fails safely; the next explicit call refetches it
+        # through the peer-scoped history request above.
+        result = await self._inner.download_media(message.media, **kwargs)
+        if result is None:
+            raise AttachmentError("Telegram did not return the requested attachment.")
+        return metadata

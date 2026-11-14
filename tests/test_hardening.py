@@ -1,16 +1,15 @@
-import asyncio
-from datetime import datetime, timezone
 import importlib.util
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser, PeerChannel, PeerUser
+from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser, PeerChannel
 from telethon.utils import get_peer_id
 
-from telegram_mcp import server, handlers
+from telegram_mcp import handlers, server
 from telegram_mcp.cli import build_parser
 from telegram_mcp.client import ScopedClient, input_peer
 from telegram_mcp.core import AllowList, ChatEntry, ChatNotAllowed, NotConfigured, load_allowlist
@@ -99,7 +98,9 @@ async def test_forbidden_tool_denies_before_client(monkeypatch, tool, args):
 
 @pytest.mark.asyncio
 async def test_entity_cache_miss_does_not_enumerate():
-    inner = SimpleNamespace(get_entity=AsyncMock(side_effect=ValueError("not found")), get_dialogs=AsyncMock())
+    inner = SimpleNamespace(
+        get_entity=AsyncMock(side_effect=ValueError("not found")), get_dialogs=AsyncMock(),
+    )
     client = ScopedClient(inner, policy())
     with pytest.raises(ValueError, match="not found"):
         await client.get_entity(CHAT_A)
@@ -149,7 +150,9 @@ async def test_global_search_is_individual_allowed_peer_searches():
     async def get_messages(peer, **kwargs):
         assert kwargs["search"] == "query"
         return [record(get_peer_id(peer))]
-    inner = SimpleNamespace(get_entity=AsyncMock(side_effect=get_entity), get_messages=AsyncMock(side_effect=get_messages))
+    inner = SimpleNamespace(
+        get_entity=AsyncMock(side_effect=get_entity), get_messages=AsyncMock(side_effect=get_messages),
+    )
     result = await handlers.search_messages(ScopedClient(inner, policy()), policy(), "query")
     assert len(result["messages"]) == 2
     assert {get_peer_id(call.args[0]) for call in inner.get_messages.call_args_list} == {CHAT_A, CHAT_B}
@@ -166,12 +169,13 @@ async def test_text_conversion_does_not_enrich_or_download():
 
 
 @pytest.mark.asyncio
-async def test_exactly_five_read_only_tools():
+async def test_five_read_tools_and_explicit_local_download():
     tools = await server.mcp.list_tools()
     assert {tool.name for tool in tools} == {
         "list_chats", "get_chat_info", "get_messages", "get_message_context", "search_messages",
+        "download_attachment",
     }
-    assert all(tool.annotations.read_only_hint for tool in tools)
+    assert all(tool.annotations.read_only_hint == (tool.name != "download_attachment") for tool in tools)
     assert all(tool.annotations.destructive_hint is False for tool in tools)
 
 

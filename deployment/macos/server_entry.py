@@ -1,12 +1,12 @@
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 ROOT = Path('/Library/TelegramReadOnly')
 sys.path.insert(0, str(ROOT / 'src'))
 
-from telegram_mcp.server import serve
+from telegram_mcp.server import serve  # noqa: E402 - fixed protected import path above
 
 credentials_file = ROOT / 'private' / 'credentials.json'
 if credentials_file.is_file():
